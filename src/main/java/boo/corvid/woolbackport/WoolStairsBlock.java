@@ -1,7 +1,5 @@
 package boo.corvid.woolbackport;
 
-import eu.pb4.polymer.blocks.api.BlockModelType;
-import eu.pb4.polymer.blocks.api.PolymerBlockResourceUtils;
 import eu.pb4.polymer.blocks.api.PolymerTexturedBlock;
 import eu.pb4.polymer.virtualentity.api.BlockWithElementHolder;
 import eu.pb4.polymer.virtualentity.api.ElementHolder;
@@ -12,6 +10,7 @@ import net.minecraft.core.component.DataComponents;
 import net.minecraft.resources.Identifier;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.StairBlock;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.block.state.properties.Half;
@@ -23,10 +22,20 @@ import java.util.IdentityHashMap;
 import java.util.Map;
 
 /**
- * A real wool/concrete stair. The client sees an invisible, stair-shaped donor state matching this
- * state's orientation, so collision and targeting line up with the real block: you walk up smoothly
- * and can click/place on the whole stair, including the top step. An item-display entity carries the
- * right shape model (straight/inner/outer), rotated to match the vanilla blockstate.
+ * A real wool/concrete stair. The client sees a stair-shaped donor state matching this state's
+ * orientation, so collision and targeting line up with the real block: you walk up smoothly and can
+ * click/place on the whole stair, including the top step. An item-display entity carries the right
+ * shape model (straight/inner/outer), rotated to match the vanilla blockstate.
+ *
+ * <p>Stairs cannot be drawn as real blocks the way bottom slabs are (see {@link WoolSlabBlock}): they
+ * need 40 shapes per colour, and Polymer's stair pools hold only 4 states per orientation (the four
+ * copper stairs), so there is room for four colours, not thirty-two. The donor is therefore
+ * <i>visible</i> — the matching waxed cut copper stair — rather than an empty model. An empty donor
+ * is a hole in the world for the tick before the display entity is sent, which reads as another
+ * block flashing on placement; a visible donor of the same shape is hidden by the display, whose
+ * model cuboids are grown ~5 mm past the donor's so the two never z-fight (generated that way in
+ * tools/gen_assets.py, not scaled on the entity - a scale about the model centre cannot move the
+ * tread at y=8), so placing simply shows a solid stair that immediately becomes wool.
  */
 public class WoolStairsBlock extends StairBlock
         implements PolymerTexturedBlock, BlockWithElementHolder, WoolBackport.DisplayProvider {
@@ -40,22 +49,18 @@ public class WoolStairsBlock extends StairBlock
     public WoolStairsBlock(BlockState baseState, Properties properties, String base) {
         super(baseState, properties);
         this.sourceState = baseState; // the matching full block; drives break particles + sound
-        this.straightModel = Identifier.fromNamespaceAndPath(WoolBackport.MOD_ID, base + "_stairs");
-        this.innerModel = Identifier.fromNamespaceAndPath(WoolBackport.MOD_ID, base + "_stairs_inner");
-        this.outerModel = Identifier.fromNamespaceAndPath(WoolBackport.MOD_ID, base + "_stairs_outer");
+        // Model ids are the native minecraft: ids (not our namespace): the ITEM_MODEL component and
+        // third-party item resolvers look the model up by the id they hold, which is the real one.
+        this.straightModel = Identifier.withDefaultNamespace(base + "_stairs");
+        this.innerModel = Identifier.withDefaultNamespace(base + "_stairs_inner");
+        this.outerModel = Identifier.withDefaultNamespace(base + "_stairs_outer");
 
-        // Client donor is the matching invisible STAIR state (facing/half/shape/waterlogged): the
-        // client's collision and outline are the true stair shape, so walking up is accurate and the
-        // whole stair — including the top step — is clickable to break or place against. These donors
-        // are invisible (requestEmpty), so unlike a visible textured block they don't draw from
-        // Polymer's tiny donor pool; we can hand out the exact orientation for every state. A stair
-        // donor's full faces do cull neighbours, but the display entity renders the stair flush
-        // over the cell, so there's no see-through void (that only happened in round 1, before the
-        // display was covering it). The real stair shape stays authoritative server-side.
+        // Visible client donor: the matching waxed cut copper stair, which copies this state's
+        // facing/half/shape/waterlogged, so the client's collision, outline and targeting are the true
+        // stair shape and the block is never a hole. Its own metallic texture is hidden behind the
+        // display entity. (The real stair shape stays authoritative server-side.)
         for (BlockState state : getStateDefinition().getPossibleStates()) {
-            clientStates.put(state, PolymerBlockResourceUtils.requestEmpty(
-                    BlockModelType.getStairs(state.getValue(FACING), state.getValue(HALF), state.getValue(SHAPE),
-                            state.getValue(WATERLOGGED))));
+            clientStates.put(state, Blocks.WAXED_CUT_COPPER_STAIRS.withPropertiesOf(state));
         }
     }
 
@@ -90,6 +95,17 @@ public class WoolStairsBlock extends StairBlock
     @Override
     public Quaternionf displayRotation(BlockState state) {
         return stairRotation(state.getValue(FACING), state.getValue(HALF), state.getValue(SHAPE));
+    }
+
+    /**
+     * Required for corner shapes to appear: Polymer only sends element data (the display's model and
+     * rotation) while ticking the holder, and this defaults to false. Un-ticked, a holder keeps
+     * showing the state it was created with, so a straight stair never turns into a corner when a
+     * neighbour is placed next to it.
+     */
+    @Override
+    public boolean tickElementHolder(ServerLevel world, BlockPos pos, BlockState initialBlockState) {
+        return true;
     }
 
     @Override

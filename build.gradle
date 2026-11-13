@@ -1,7 +1,7 @@
 plugins {
     // Unobfuscated Loom for MC 26.x: no remapping, so the old mod* configurations
     // (modImplementation/modApi) no longer exist — use plain implementation + include.
-    // 1.15.+ is the line Polymer itself builds 26.2 with.
+    // 1.15.+ handles the unobfuscated 26.x line; Polymer 0.16.5+26.1.2 builds with the 1.14/1.15 series.
     id 'net.fabricmc.fabric-loom' version '1.15.+'
     id 'java'
 }
@@ -33,8 +33,8 @@ dependencies {
 
     // Server Translations API: sends per-client fallback names for our block.minecraft.* keys, so
     // vanilla clients see "White Wool Stairs" instead of the raw id. Data-driven (data/*/lang), no
-    // code. Bundled jar-in-jar. Pinned to 26.2; dropped alongside the polyfill at 26.3.
-    implementation include("xyz.nucleoid:server-translations-api:3.1.0+26.2")
+    // code. Bundled jar-in-jar. Pinned to 26.1; dropped alongside the polyfill at 26.3.
+    implementation include("xyz.nucleoid:server-translations-api:3.0.3+26.1")
 
     // Sound patcher: step/mining-hit/fall are predicted client-side from the invisible copper-stairs
     // donor (metallic). This module silences that prediction (via the pack) and makes the server send

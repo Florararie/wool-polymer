@@ -1,19 +1,30 @@
 package boo.corvid.woolbackport;
 
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+import eu.pb4.polymer.blocks.api.BlockModelType;
+import eu.pb4.polymer.blocks.api.PolymerBlockModel;
+import eu.pb4.polymer.blocks.api.PolymerBlockResourceUtils;
 import eu.pb4.polymer.blocks.api.PolymerTexturedBlock;
 import eu.pb4.polymer.resourcepack.api.PolymerResourcePackUtils;
+import eu.pb4.polymer.resourcepack.api.ResourcePackBuilder;
+import eu.pb4.polymer.resourcepack.impl.generation.DefaultRPBuilder;
 import eu.pb4.polymer.soundpatcher.api.SoundPatcher;
 import eu.pb4.polymer.virtualentity.api.ElementHolder;
 import eu.pb4.polymer.virtualentity.api.attachment.BlockAwareAttachment;
 import eu.pb4.polymer.virtualentity.api.attachment.HolderAttachment;
+import eu.pb4.polymer.core.api.item.PolymerCreativeModeTabUtils;
 import eu.pb4.polymer.virtualentity.api.elements.ItemDisplayElement;
 import net.fabricmc.api.ModInitializer;
+import net.fabricmc.fabric.api.creativetab.v1.CreativeModeTabEvents;
 import net.minecraft.core.Registry;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.resources.Identifier;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.world.item.Item;
+import net.minecraft.network.chat.Component;
+import net.minecraft.world.item.CreativeModeTabs;
 import net.minecraft.world.item.ItemDisplayContext;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
@@ -27,24 +38,31 @@ import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
 /**
- * Backports 26.3's wool and concrete stairs and slabs (all 16 colors each) to 26.2, server-side,
+ * Backports 26.3's wool and concrete stairs and slabs (all 16 colors each) to 26.1.2, server-side,
  * via Polymer.
  *
  * Blocks are registered under their native {@code minecraft:} ids, so world data is identical to
  * 26.3 and native takes over with zero migration once the server updates. The mod refuses to load
- * on 26.3 (fabric.mod.json depends "minecraft": ">=26.2 <26.3"); the registry guard below is a
- * second safety net against re-registering an id that already exists natively.
+ * outside the 26.1.x line (fabric.mod.json depends "minecraft": ">=26.1.2 <26.2"); the registry
+ * guard below is a second safety net against re-registering an id that already exists natively.
  *
- * Vanilla clients can't render 16 colors of stairs/slabs through Polymer's tiny donor-state pools
- * (~4 slab / ~3 stair colors max), so each placed block is shown via a per-block item-display
- * entity whose item-model is the block model (no pool limit). The real server-side StairBlock/
- * SlabBlock keeps correct collision; the client block is an invisible, shape-correct donor state.
+ * Vanilla clients can't render 16 colors of stairs/slabs: a client only has shapes Minecraft ships,
+ * and Polymer's donor pools hold 5 slab states and 4 states per stair orientation, not 32. Bottom
+ * slabs are the exception — the sculk-sensor pool has 75 usable states per waterlogging at exactly a
+ * bottom slab's shape, so those become real client blocks (instant, smooth-lit). Top slabs and stairs
+ * stay a per-block item-display entity over a shape-correct donor block that the client collides
+ * with. That donor is visible rather than empty: an empty one is a hole until the entity is sent,
+ * which looks like another block flashing when you place something. The real server-side
+ * StairBlock/SlabBlock keeps collision either way.
  */
 public class WoolBackport implements ModInitializer {
     public static final String MOD_ID = "woolbackport";
@@ -97,6 +115,7 @@ public class WoolBackport implements ModInitializer {
         SLAB_DISPLAY = registerDisplayItem("slab_display", Items.OAK_SLAB, true);
 
         Set<SoundType> donorSounds = new HashSet<>();
+        List<Item> creativeItems = new ArrayList<>();
         for (String material : pending) {
             for (String color : COLORS) {
                 String base = color + "_" + material;
@@ -108,14 +127,131 @@ public class WoolBackport implements ModInitializer {
                 // falls back to a stair shape via STAIRS_DISPLAY/SLAB_DISPLAY.
                 Block stairs = new WoolStairsBlock(source.defaultBlockState(), props(source, base + "_stairs"), base);
                 Block slab = new WoolSlabBlock(props(source, base + "_slab"), source, base);
-                register(base + "_stairs", stairs, source.asItem());
-                register(base + "_slab", slab, source.asItem());
+                creativeItems.add(register(base + "_stairs", stairs, source.asItem()));
+                creativeItems.add(register(base + "_slab", slab, source.asItem()));
                 collectDonorSounds(stairs, donorSounds);
                 collectDonorSounds(slab, donorSounds);
             }
         }
 
         makeDonorStepSoundsServerAuthoritative(donorSounds);
+        addToCreativeInventory(creativeItems);
+        registerCreativeTab(creativeItems);
+
+        // Polymer rewrites a donor's blockstate file with only the states it handed out, so this puts
+        // vanilla's own variants back for the ones we borrowed (see restoreDonorVariants). Registered
+        // after the blocks above, i.e. after Polymer registered its own creation hook, so we also get
+        // to queue in front-of-nothing on the builder's build event (where it actually generates).
+        PolymerResourcePackUtils.RESOURCE_PACK_CREATION_EVENT.register(WoolBackport::queueDonorVariantMerge);
+    }
+
+    /**
+     * Puts the blocks into Building Blocks, in the order they were registered (dye order, stairs then
+     * slab, wool family before concrete).
+     *
+     * The client builds creative tabs out of its own item registry, so it can only ever show items it
+     * knows — and these ids are ours, not vanilla 26.1.2's. Polymer therefore syncs tab contents per
+     * player, and it computes them through Fabric's tab events, so registering here is what makes them
+     * appear. That path needs Polymer on the client: a vanilla client never receives tab contents (it
+     * has no way to name the items anyway), so there {@code /give} stays the way to get them.
+     */
+    private static void addToCreativeInventory(List<Item> items) {
+        CreativeModeTabEvents.modifyOutputEvent(CreativeModeTabs.BUILDING_BLOCKS)
+                .register(output -> {
+                    for (Item item : items) {
+                        output.accept(new ItemStack(item));
+                    }
+                });
+    }
+
+    /**
+     * Polymer's own creative tab. Vanilla tabs are built by the client and then patched over the wire,
+     * so they only gain our items on clients running Polymer, and only if that patch lands; a tab
+     * definition is created client-side from our data instead, so it always shows the real items.
+     *
+     * Only clients running Polymer see it: it has to tell the client what the tab is, and a vanilla
+     * client cannot name items its own registry does not contain, so {@code /give} stays their path.
+     */
+    private static void registerCreativeTab(List<Item> items) {
+        var tab = PolymerCreativeModeTabUtils.builder()
+                .title(Component.translatable("itemGroup.woolbackport.backport"))
+                .icon(() -> new ItemStack(items.getFirst()))
+                .displayItems((params, output) -> items.forEach(item -> output.accept(new ItemStack(item))))
+                .build();
+        PolymerCreativeModeTabUtils.registerPolymerCreativeModeTab(
+                Identifier.fromNamespaceAndPath(MOD_ID, "backport"), tab);
+    }
+
+    /**
+     * The donor blockstates do not exist yet during the creation hook: Polymer generates them on the
+     * builder's own build event ({@code BlockResourceCreator.registerEvent}), which every creation hook
+     * has already returned from. So queue the merge there. Both are consumer events invoked in
+     * registration order, and Polymer registered first, so this runs with the generated files in hand.
+     */
+    private static void queueDonorVariantMerge(ResourcePackBuilder builder) {
+        if (builder instanceof DefaultRPBuilder<?> late) {
+            late.buildEvent.register(credits -> restoreDonorVariants(builder));
+        } else {
+            LOGGER.warn("[{}] unexpected pack builder {}, sculk variants left unmerged", MOD_ID, builder.getClass());
+        }
+    }
+
+    /**
+     * A real client block state that renders one of our models. Sculk sensors are the only vanilla
+     * donor big enough for 32 colors at slab shape: 75 usable states per waterlogging (15 sensors + 60
+     * calibrated), all of them at {@code power=1..15} — a property vanilla's blockstate ignores and a
+     * real sensor only holds while it is active. Polymer normalises every real sensor to
+     * {@code power=0} when sending it, and {@link #restoreDonorVariants} puts vanilla's variants back,
+     * so borrowing these states cannot change how sculk sensors look.
+     *
+     * @return the allocated state, or null if the pool is exhausted (caller falls back to a visible
+     *         donor plus a display entity)
+     */
+    static @Nullable BlockState requestSculkState(boolean waterlogged, Identifier model) {
+        return PolymerBlockResourceUtils.requestBlock(
+                waterlogged ? BlockModelType.SCULK_SENSOR_WATERLOGGED : BlockModelType.SCULK_SENSOR,
+                PolymerBlockModel.of(model));
+    }
+
+    /**
+     * Polymer replaces a donor block's blockstate file with just the states it allocated, which would
+     * leave every other state of that block — including the one it normalises real blocks to — without
+     * a model. We add vanilla's own variant entries back: ours name every property of a state, so they
+     * win for the states we allocated, and the client resolves everything else exactly as vanilla.
+     */
+    private static void restoreDonorVariants(ResourcePackBuilder builder) {
+        for (String donor : new String[]{"sculk_sensor", "calibrated_sculk_sensor"}) {
+            String path = "assets/minecraft/blockstates/" + donor + ".json";
+            byte[] generated = builder.getData(path);
+            if (generated == null) {
+                continue; // no state of this donor was allocated
+            }
+            // Copy of vanilla's file, shipped at data/woolbackport/vanilla_blockstates/ (extracted
+            // from 26.1.2). Read from the classpath: once our data is in the builder, its own
+            // getDataOrSource() returns ours, not vanilla's.
+            try (InputStream vanilla = WoolBackport.class.getResourceAsStream(
+                    "/data/" + MOD_ID + "/vanilla_blockstates/" + donor + ".json")) {
+                if (vanilla == null) {
+                    LOGGER.warn("[{}] no vanilla blockstate copy for {}, leaving it unmerged", MOD_ID, donor);
+                    continue;
+                }
+                JsonObject merged = JsonParser.parseString(new String(generated, StandardCharsets.UTF_8))
+                        .getAsJsonObject();
+                JsonObject variants = merged.getAsJsonObject("variants");
+                JsonObject original = JsonParser.parseString(new String(vanilla.readAllBytes(), StandardCharsets.UTF_8))
+                        .getAsJsonObject().getAsJsonObject("variants");
+                for (var entry : original.entrySet()) {
+                    // Gaps only: a full state name we allocated is more specific and must keep winning.
+                    if (!variants.has(entry.getKey())) {
+                        variants.add(entry.getKey(), entry.getValue());
+                    }
+                }
+                builder.addData(path, merged.toString().getBytes(StandardCharsets.UTF_8));
+                LOGGER.info("[{}] restored {} vanilla variants in {}'s blockstate", MOD_ID, original.size(), donor);
+            } catch (IOException e) {
+                LOGGER.warn("[{}] failed to merge vanilla variants for {}", MOD_ID, donor, e);
+            }
+        }
     }
 
     /**
@@ -162,7 +298,7 @@ public class WoolBackport implements ModInitializer {
                 .setId(ResourceKey.create(Registries.BLOCK, Identifier.withDefaultNamespace(path)));
     }
 
-    private static void register(String path, Block block, Item fallback) {
+    private static Item register(String path, Block block, Item fallback) {
         Identifier id = Identifier.withDefaultNamespace(path);
         Registry.register(BuiltInRegistries.BLOCK, id, block);
         // useBlockDescriptionPrefix() makes the item's default name key "block.minecraft.<path>"
@@ -171,8 +307,8 @@ public class WoolBackport implements ModInitializer {
         var itemProps = new Item.Properties()
                 .useBlockDescriptionPrefix()
                 .setId(ResourceKey.create(Registries.ITEM, id));
-        Registry.register(BuiltInRegistries.ITEM, id,
-                new WoolBlockItem(block, itemProps, Identifier.fromNamespaceAndPath(MOD_ID, path), fallback));
+        return Registry.register(BuiltInRegistries.ITEM, id,
+                new WoolBlockItem(block, itemProps, Identifier.withDefaultNamespace(path), fallback));
     }
 
     /** Registers a shared display-entity item under a woolbackport: id (never in a creative tab). */
@@ -192,10 +328,10 @@ public class WoolBackport implements ModInitializer {
     }
 
     /**
-     * One item-display entity per placed block, rendered flush in the cell (ItemDisplayContext.NONE,
-     * holder auto-anchored at block center). Rebuilds itself on block-state changes (e.g. a stair's
-     * corner shape changing when a neighbor is placed, or a slab becoming a double).
-     * Lifecycle (create on chunk load, destroy on unload/break) is handled by Polymer.
+     * One item-display entity per placed block that needs one, rendered flush in the cell
+     * (ItemDisplayContext.NONE, holder auto-anchored at block center). Rebuilds itself on block-state
+     * changes (e.g. a stair's corner shape changing when a neighbor is placed, or a slab becoming a
+     * double). Lifecycle (create on chunk load, destroy on unload/break) is handled by Polymer.
      */
     public static class WoolDisplayHolder extends ElementHolder {
         private final DisplayProvider provider;
@@ -219,8 +355,13 @@ public class WoolBackport implements ModInitializer {
                 element = new ItemDisplayElement();
                 // FIXED is the "placed block" context but bakes a 0.5 scale, so x2 -> flush 1x1x1.
                 // (NONE does not sit flush for item displays.) Anchored at block center by the holder.
+                // The clearance over the donor lives in the MODEL, not here: gen_assets grows every
+                // cuboid by 0.08 (5mm) when it builds the display models. Scaling the display instead
+                // cannot work - a uniform scale about the model center leaves the plane through that
+                // center exactly where it was, and a stair tread and a top slab's underside both lie
+                // on y=8, i.e. on that plane, so those faces kept z-fighting no matter the factor.
                 element.setItemDisplayContext(ItemDisplayContext.FIXED);
-                element.setScale(new Vector3f(2));
+                element.setScale(new Vector3f(2.0f));
                 element.setInvisible(true);
                 element.setDisplaySize(1, 1);
                 addElement(element);

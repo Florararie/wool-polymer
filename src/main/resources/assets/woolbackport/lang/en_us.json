@@ -62,5 +62,6 @@
   "block.minecraft.yellow_concrete_slab": "Yellow Concrete Slab",
   "block.minecraft.yellow_concrete_stairs": "Yellow Concrete Stairs",
   "block.minecraft.yellow_wool_slab": "Yellow Wool Slab",
-  "block.minecraft.yellow_wool_stairs": "Yellow Wool Stairs"
+  "block.minecraft.yellow_wool_stairs": "Yellow Wool Stairs",
+  "itemGroup.woolbackport.backport": "Wool & Concrete Stairs & Slabs"
 }

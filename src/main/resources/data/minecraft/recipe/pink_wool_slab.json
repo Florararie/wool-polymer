@@ -5,7 +5,9 @@
     "#": "minecraft:pink_wool"
   },
   "pattern": [
-    "###"
+    "#",
+    "#",
+    "#"
   ],
   "result": {
     "id": "minecraft:pink_wool_slab",
